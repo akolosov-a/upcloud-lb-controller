@@ -24,11 +24,13 @@ import (
 	"github.com/UpCloudLtd/upcloud-go-api/v4/upcloud"
 	upcloudrequest "github.com/UpCloudLtd/upcloud-go-api/v4/upcloud/request"
 	upcloudservice "github.com/UpCloudLtd/upcloud-go-api/v4/upcloud/service"
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"net.kolosov/upcloud-lb-controller/pkg/upcloudlbcontroller"
 )
@@ -42,8 +44,30 @@ type ServiceReconciler struct {
 }
 
 //+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+var (
+	upcloudOperations = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ulc_upcloud_operation_total",
+			Help: "Number of operations on Upcloud resources",
+		},
+		[]string{"resource", "operation"},
+	)
+
+	upcloudOperationErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ulc_upcloud_operation_errors_total",
+			Help: "Number of failed operations on Upcloud resources",
+		},
+		[]string{"resource", "operation"},
+	)
+)
 //+kubebuilder:rbac:groups=core,resources=services/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=core,resources=services/finalizers,verbs=update
+
+func init() {
+	// Register custom metrics with the global prometheus registry
+	metrics.Registry.MustRegister(upcloudOperations, upcloudOperationErrors)
+}
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -147,8 +171,10 @@ func (r *ServiceReconciler) getUpcloudLoadbalancerForService(service *corev1.Ser
 	}
 
 	if lbDNSName != "" {
+		upcloudOperations.With(prometheus.Labels{"resource": "LoadBalancer", "operation": "LIST"}).Inc()
 		lbs, err := r.UpcloudSvc.GetLoadBalancers(&upcloudrequest.GetLoadBalancersRequest{})
 		if err != nil {
+			upcloudOperationErrors.With(prometheus.Labels{"resource": "LoadBalancer", "operation": "LIST"}).Inc()
 			return nil, err
 		}
 
@@ -159,7 +185,8 @@ func (r *ServiceReconciler) getUpcloudLoadbalancerForService(service *corev1.Ser
 		}
 	}
 
-	return r.UpcloudSvc.CreateLoadBalancer(&upcloudrequest.CreateLoadBalancerRequest{
+	upcloudOperations.With(prometheus.Labels{"resource": "LoadBalancer", "operation": "CREATE"}).Inc()
+	lb, err := r.UpcloudSvc.CreateLoadBalancer(&upcloudrequest.CreateLoadBalancerRequest{
 		Name:             fmt.Sprintf("%s-%s", service.Name, service.UID),
 		Plan:             r.UpcloudLbCfg.Plan,
 		Zone:             r.UpcloudLbCfg.Zone,
@@ -169,6 +196,11 @@ func (r *ServiceReconciler) getUpcloudLoadbalancerForService(service *corev1.Ser
 		Backends:         []upcloudrequest.LoadBalancerBackend{},
 		Resolvers:        []upcloudrequest.LoadBalancerResolver{},
 	})
+	if err != nil {
+		upcloudOperationErrors.With(prometheus.Labels{"resource": "LoadBalancer", "operation": "CREATE"}).Inc()
+	}
+
+	return lb, err
 }
 
 func (r *ServiceReconciler) getUpcloudFrontendForPort(lb *upcloud.LoadBalancer, port *corev1.ServicePort) (*upcloud.LoadBalancerFrontend, error) {
@@ -178,18 +210,24 @@ func (r *ServiceReconciler) getUpcloudFrontendForPort(lb *upcloud.LoadBalancer, 
 		}
 	}
 
-	return r.UpcloudSvc.CreateLoadBalancerFrontend(&upcloudrequest.CreateLoadBalancerFrontendRequest{
+	upcloudOperations.With(prometheus.Labels{"resource": "LoadBalancerFrontend", "operation": "CREATE"}).Inc()
+	f, err := r.UpcloudSvc.CreateLoadBalancerFrontend(&upcloudrequest.CreateLoadBalancerFrontendRequest{
 		ServiceUUID: lb.UUID,
 		Frontend: upcloudrequest.LoadBalancerFrontend{
-			Name:           getPortName(port),
+			Name:           portName,
 			Mode:           "tcp",
 			Port:           int(port.Port),
-			DefaultBackend: getPortName(port),
+			DefaultBackend: portName,
 			Rules:          []upcloudrequest.LoadBalancerFrontendRule{},
 			TLSConfigs:     []upcloudrequest.LoadBalancerFrontendTLSConfig{},
 			Properties:     nil,
 		},
 	})
+	if err != nil {
+		upcloudOperationErrors.With(prometheus.Labels{"resource": "LoadBalancerFrontend", "operation": "CREATE"}).Inc()
+	}
+
+	return f, err
 }
 
 func (r *ServiceReconciler) getUpcloudBackendForPort(lb *upcloud.LoadBalancer, port *corev1.ServicePort) (*upcloud.LoadBalancerBackend, error) {
@@ -199,15 +237,21 @@ func (r *ServiceReconciler) getUpcloudBackendForPort(lb *upcloud.LoadBalancer, p
 		}
 	}
 
-	return r.UpcloudSvc.CreateLoadBalancerBackend(&upcloudrequest.CreateLoadBalancerBackendRequest{
+	upcloudOperations.With(prometheus.Labels{"resource": "LoadBalancerBackend", "operation": "CREATE"}).Inc()
+	b, err := r.UpcloudSvc.CreateLoadBalancerBackend(&upcloudrequest.CreateLoadBalancerBackendRequest{
 		ServiceUUID: lb.UUID,
 		Backend: upcloudrequest.LoadBalancerBackend{
-			Name:       getPortName(port),
+			Name:       portName,
 			Resolver:   "",
 			Members:    []upcloudrequest.LoadBalancerBackendMember{},
 			Properties: nil,
 		},
 	})
+	if err != nil {
+		upcloudOperationErrors.With(prometheus.Labels{"resource": "LoadBalancerBackend", "operation": "CREATE"}).Inc()
+	}
+
+	return b, err
 }
 
 func (r *ServiceReconciler) reconcileFrontend(lb *upcloud.LoadBalancer, f *upcloud.LoadBalancerFrontend, port *corev1.ServicePort) error {
@@ -215,6 +259,7 @@ func (r *ServiceReconciler) reconcileFrontend(lb *upcloud.LoadBalancer, f *upclo
 		return nil
 	}
 
+	upcloudOperations.With(prometheus.Labels{"resource": "LoadBalancerFrontend", "operation": "MODIFY"}).Inc()
 	_, err := r.UpcloudSvc.ModifyLoadBalancerFrontend(&upcloudrequest.ModifyLoadBalancerFrontendRequest{
 		ServiceUUID: lb.UUID,
 		Name:        f.Name,
@@ -226,6 +271,10 @@ func (r *ServiceReconciler) reconcileFrontend(lb *upcloud.LoadBalancer, f *upclo
 			Properties:     f.Properties,
 		},
 	})
+	if err != nil {
+		upcloudOperationErrors.With(prometheus.Labels{"resource": "LoadBalancerFrontend", "operation": "MODIFY"}).Inc()
+	}
+
 	return err
 }
 
@@ -273,7 +322,9 @@ func (r *ServiceReconciler) createBackendMember(lb *upcloud.LoadBalancer, b *upc
 	if err != nil {
 		return nil, err
 	}
-	return r.UpcloudSvc.CreateLoadBalancerBackendMember(&upcloudrequest.CreateLoadBalancerBackendMemberRequest{
+
+	upcloudOperations.With(prometheus.Labels{"resource": "LoadBalancerBackendMember", "operation": "CREATE"}).Inc()
+	m, err := r.UpcloudSvc.CreateLoadBalancerBackendMember(&upcloudrequest.CreateLoadBalancerBackendMemberRequest{
 		ServiceUUID: lb.UUID,
 		BackendName: b.Name,
 		Member: upcloudrequest.LoadBalancerBackendMember{
@@ -286,6 +337,11 @@ func (r *ServiceReconciler) createBackendMember(lb *upcloud.LoadBalancer, b *upc
 			Port:        int(p.NodePort),
 		},
 	})
+	if err != nil {
+		upcloudOperationErrors.With(prometheus.Labels{"resource": "LoadBalancerBackendMember", "operation": "CREATE"}).Inc()
+	}
+
+	return m, err
 }
 
 func (r *ServiceReconciler) reconcileBackendMember(lb *upcloud.LoadBalancer, b *upcloud.LoadBalancerBackend, m *upcloud.LoadBalancerBackendMember, n *corev1.Node, p *corev1.ServicePort) error {
@@ -293,11 +349,18 @@ func (r *ServiceReconciler) reconcileBackendMember(lb *upcloud.LoadBalancer, b *
 }
 
 func (r *ServiceReconciler) deleteBackendMember(lb *upcloud.LoadBalancer, b *upcloud.LoadBalancerBackend, m *upcloud.LoadBalancerBackendMember) error {
-	return r.UpcloudSvc.DeleteLoadBalancerBackendMember(&upcloudrequest.DeleteLoadBalancerBackendMemberRequest{
+	upcloudOperations.With(prometheus.Labels{"resource": "LoadBalancerBackendMember", "operation": "DELETE"}).Inc()
+	err := r.UpcloudSvc.DeleteLoadBalancerBackendMember(&upcloudrequest.DeleteLoadBalancerBackendMemberRequest{
 		ServiceUUID: lb.UUID,
 		BackendName: b.Name,
 		Name:        m.Name,
 	})
+	if err != nil {
+		upcloudOperationErrors.With(prometheus.Labels{"resource": "LoadBalancerBackendMember", "operation": "DELETE"}).Inc()
+	}
+
+	return err
+}
 }
 
 func getNodeInternalIP(n *corev1.Node) (string, error) {
