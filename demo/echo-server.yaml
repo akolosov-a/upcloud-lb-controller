@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-server
+  labels:
+    app: echo-server
+spec:
+  selector:
+    matchLabels:
+      app: echo-server
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: echo-server
+    spec:
+      containers:
+      - name: socat
+        image: alpine/socat:latest
+        args:
+        - -v
+        - tcp-l:1234,fork
+        - exec:/bin/cat
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        ports:
+        - containerPort: 1234
+          name: echo
+      terminationGracePeriodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-server
+spec:
+  selector:
+    app: echo-server
+  type: LoadBalancer
+  ports:
+  - name: echo
+    protocol: TCP
+    port: 1234
+    targetPort: echo

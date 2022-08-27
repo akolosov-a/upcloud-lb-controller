@@ -1,94 +1,50 @@
-# upcloud-lb-controller
-// TODO(user): Add simple overview of use/purpose
+# UpCloud Load Balancer Controller
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+UpCloud Load Balancer Controller creates and manages [UpClound loadbalancers](https://upcloud.com/products/managed-load-balancer) for
+[Loadbalacner Kubernetes Services](https://kubernetes.io/docs/concepts/services-networking/service/#loadbalancer).
 
-## Getting Started
-You’ll need a Kubernetes cluster to run against. You can use [KIND](https://sigs.k8s.io/kind) to get a local cluster for testing, or run against a remote cluster.
-**Note:** Your controller will automatically use the current context in your kubeconfig file (i.e. whatever cluster `kubectl cluster-info` shows).
+## Features
+- Creation of an Upcloud LB pointing to the cluster nodes for every LoadBalacner typed Service resource
+- Updating the existing Upcloud LB instance corresponding to a Service in response to changes in its configuration (e.g. ports added or ports deleted)
+- Reflecting the LB address in Service resource status.
+- **(NOT IMPLEMENTED)** Deletion of an Upcloud LB in response to deletion of the corresponding Service resource
 
-### Running on the cluster
-1. Install Instances of Custom Resources:
+## Demo
 
-```sh
-kubectl apply -f config/samples/
+1. Create a k8s cluster in the UpCloud using [k3s](https://k3s.io/)
+```bash
+ZONE=fi-hel1
+
+# Create a private network
+upctl network create --name ulc_test --zone ${ZONE} --ip-network address=10.0.10.0/24,dhcp=true
+NETWORK_UUID=$(upctl network show ulc_test -o json | jq -r .uuid)
+
+# Create a server with Kubernetes cluster (k3s implementation)
+upctl server create --hostname ulc-test --zone ${ZONE} --ssh-keys ~/.ssh/id_rsa.pub --network type=public,family=IPv4 --network type=private,network=03a51e37-6847-4ebe-afc3-413a87859fac,ip-address=10.0.10.3  --enable-metadata --wait
+SERVER_IP=$(upctl server show ulc-test -o json | jq -r '.nics[] | select(.type == "public") | .ip_address' | awk -F': ' '{print $2}')
+
+# Install k3s
+cat demo/install_k3s.sh | ssh root@${SERVER_IP} sh -
+ssh root@${SERVER_IP} cat /etc/rancher/k3s/k3s.yaml | sed "s/127.0.0.1/${SERVER_IP}/" > ./kubeconfig
 ```
 
-2. Build and push your image to the location specified by `IMG`:
-	
-```sh
-make docker-build docker-push IMG=<some-registry>/upcloud-lb-controller:tag
-```
-	
-3. Deploy the controller to the cluster with the image specified by `IMG`:
-
-```sh
-make deploy IMG=<some-registry>/upcloud-lb-controller:tag
+2. Deploy Upcloud LB Controller
+```bash
+export KUBECONFIG=./kubeconfig
+kubectl -n kube-system create secret generic upcloud-credentials --from-literal=UPCLOUD_USERNAME="YOUR UPCLOUD API USERNAME" --from-literal=UPCLOUD_PASSWORD="YOUR UPCLOUD API PASSWORD"`
+kubectl -n kube-system create cm upcloud-lb-controller --from-literal=UPCLOUD_ZONE=${ZONE} --from-literal=UPCLOUD_NETWORK=${NETWORK_UUID}
+kubectl apply -f deploy/
 ```
 
-### Uninstall CRDs
-To delete the CRDs from the cluster:
-
-```sh
-make uninstall
+3. Deploy a TCP echo server
+```bash
+# Create a deployment with echo server and publish its port with an LoadBalancer K8s Service
+kuebctl apply demo/echo-server.yaml
 ```
 
-### Undeploy controller
-UnDeploy the controller to the cluster:
-
-```sh
-make undeploy
+4. Test connectivity
+```bash
+LB_ADDRESS=$(kubectl get svc echo-server -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+echo "Is there anybody out there?" | nc ${LB_ADDRESS} 1234
+Is there anybody out there?
 ```
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-### How it works
-This project aims to follow the Kubernetes [Operator pattern](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/)
-
-It uses [Controllers](https://kubernetes.io/docs/concepts/architecture/controller/) 
-which provides a reconcile function responsible for synchronizing resources untile the desired state is reached on the cluster 
-
-### Test It Out
-1. Install the CRDs into the cluster:
-
-```sh
-make install
-```
-
-2. Run your controller (this will run in the foreground, so switch to a new terminal if you want to leave it running):
-
-```sh
-make run
-```
-
-**NOTE:** You can also run this in one step by running: `make install run`
-
-### Modifying the API definitions
-If you are editing the API definitions, generate the manifests such as CRs or CRDs using:
-
-```sh
-make manifests
-```
-
-**NOTE:** Run `make --help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2022.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-

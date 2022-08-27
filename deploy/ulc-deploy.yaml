@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: upcloud-lb-controller
+  namespace: kube-system
+  labels:
+    app: upcloud-lb-controller
+spec:
+  selector:
+    matchLabels:
+      app: upcloud-lb-controller
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: upcloud-lb-controller
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+      - args:
+        - -upcloud-zone
+        - $(UPCLOUD_ZONE)
+        - -upcloud-lb-network
+        - $(UPCLOUD_NETWORK)
+        - -upcloud-username
+        - $(UPCLOUD_USERNAME)
+        - -upcloud-password
+        - $(UPCLOUD_PASSWORD)
+        envFrom:
+        - secretRef:
+            name: upcloud-credentials
+        - configMapRef:
+            name: upcloud-lb-controller
+        image: ghcr.io/akolosov-a/upcloud-lb-controller:main
+        name: manager
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+      serviceAccountName: upcloud-lb-controller
+      terminationGracePeriodSeconds: 10

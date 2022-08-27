@@ -64,7 +64,7 @@ var (
 //+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=core,resources=services/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=core,resources=services/finalizers,verbs=update
-//+kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list
+//+kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
 
 func init() {
 	// Register custom metrics with the global prometheus registry
