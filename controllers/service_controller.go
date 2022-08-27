@@ -33,10 +33,6 @@ import (
 	"net.kolosov/upcloud-lb-controller/pkg/upcloudlbcontroller"
 )
 
-var (
-	upcloudLbUUIDAnnotation = "upcloud-lb.kolosov.net/lb-uuid"
-)
-
 // ServiceReconciler reconciles a Service object
 type ServiceReconciler struct {
 	client.Client
@@ -69,21 +65,18 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if service.Spec.Type != corev1.ServiceTypeLoadBalancer {
-		log.Info(fmt.Sprintf("Skipping non LoadBalancer service"))
+		log.Info("Skipping non LoadBalancer service")
 		return ctrl.Result{}, nil
 	}
 
 	log.Info("Reconciling LoadBalancer for the service")
 
-	var nodes corev1.NodeList
-	if err := r.List(ctx, &nodes); err != nil {
+	var nodeList corev1.NodeList
+	if err := r.List(ctx, &nodeList); err != nil {
 		log.Error(err, "unable to list Nodes")
 		return ctrl.Result{}, err
 	}
-	nodesMap := make(map[string]corev1.Node)
-	for _, n := range nodes.Items {
-		nodesMap[n.Name] = n
-	}
+	nodes := nodeList.Items
 
 	log.Info("Looking up or creating a LoadBalancer for the service")
 	lb, err := r.getUpcloudLoadbalancerForService(&service)
@@ -115,15 +108,25 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		backend, err = r.getUpcloudBackendForPort(lb, &port)
 		if err != nil {
-			log.Error(err, "failed to get Upcloud Backend for a service port", "port", port)
+			log.Error(err, "failed to get Upcloud Backend for a service port. Skipping port", "port", port)
+			continue
 		}
-		r.reconcileBackendMembers(lb, backend, &nodesMap, &port)
+		err = r.reconcileBackend(lb, backend, &nodes, &port)
+		if err != nil {
+			log.Error(err, "failed to reconcile Upcloud Backend for a service port", "port", port)
+			continue
+		}
 
 		frontend, err = r.getUpcloudFrontendForPort(lb, &port)
 		if err != nil {
 			log.Error(err, "failed to get Upcloud Frontend for a service port", "port", port)
+			continue
 		}
-		r.reconcileFrontend(lb, frontend, &port)
+		err = r.reconcileFrontend(lb, frontend, &port)
+		if err != nil {
+			log.Error(err, "failed to reconcile Upcloud Frontend for a service port", "port", port)
+			continue
+		}
 	}
 
 	return ctrl.Result{}, nil
@@ -226,25 +229,39 @@ func (r *ServiceReconciler) reconcileFrontend(lb *upcloud.LoadBalancer, f *upclo
 	return err
 }
 
-func (r *ServiceReconciler) reconcileBackendMembers(lb *upcloud.LoadBalancer, b *upcloud.LoadBalancerBackend, nodesMap *map[string]corev1.Node, port *corev1.ServicePort) error {
-	membersMap := make(map[string]upcloud.LoadBalancerBackendMember)
+func (r *ServiceReconciler) reconcileBackend(lb *upcloud.LoadBalancer, b *upcloud.LoadBalancerBackend, nodes *[]corev1.Node, port *corev1.ServicePort) error {
+	membersMap := make(map[string]*upcloud.LoadBalancerBackendMember)
 	for _, m := range b.Members {
-		membersMap[m.Name] = m
+		membersMap[m.Name] = &m
 	}
 
-	for name, node := range *nodesMap {
-		member, ok := membersMap[name]
-		if !ok {
-			r.createBackendMember(lb, b, &node, port)
+	nodesMap := make(map[string]*corev1.Node)
+	for _, n := range *nodes {
+		nodesMap[n.Name] = &n
+	}
+
+	for name, node := range nodesMap {
+		var err error
+		member := membersMap[name]
+		if member != nil {
+			err = r.reconcileBackendMember(lb, b, member, node, port)
 		} else {
-			r.reconcileBackendMember(lb, b, &member, &node, port)
+			_, err = r.createBackendMember(lb, b, node, port)
+		}
+
+		if err != nil {
+			return err
 		}
 	}
 
 	for name, member := range membersMap {
-		_, ok := (*nodesMap)[name]
-		if !ok {
-			r.deleteBackendMember(lb, b, &member)
+		// Check if k8s node corresponding to a backend member still exists
+		if nodesMap[name] != nil {
+			continue
+		}
+
+		if err := r.deleteBackendMember(lb, b, member); err != nil {
+			return err
 		}
 	}
 
