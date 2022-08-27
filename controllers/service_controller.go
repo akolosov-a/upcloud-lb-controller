@@ -98,7 +98,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	var nodeList corev1.NodeList
 	if err := r.List(ctx, &nodeList); err != nil {
 		log.Error(err, "unable to list Nodes")
-		return ctrl.Result{}, err
+		return ctrl.Result{Requeue: true}, err
 	}
 	nodes := nodeList.Items
 
@@ -106,7 +106,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	lb, err := r.getUpcloudLoadbalancerForService(&service)
 	if err != nil {
 		log.Error(err, "unable to get Upcloud Loadbalancer for the service")
-		return ctrl.Result{}, err
+		return ctrl.Result{Requeue: true}, err
 	}
 	log.Info("LoadBalancer found for the service", "upcloud-lb", lb.Name)
 
@@ -120,6 +120,30 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
+	// Remove frontends not found in the service ports
+	for _, frontend := range lb.Frontends {
+		if findPort(&service.Spec.Ports, frontend.Name) != nil {
+			continue
+		}
+		log.Info("Deleting unused frontend", "frontend", frontend)
+		if err := r.deleteFrontend(lb, &frontend); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Remove backends not found in the service ports
+	for _, backend := range lb.Backends {
+		if findPort(&service.Spec.Ports, backend.Name) != nil {
+			continue
+		}
+		log.Info("Deleting unused backend", "backend", backend)
+		if err := r.deleteBackend(lb, &backend); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Reconcile frontends and backends corresponding to the
+	// existing service ports
 	for _, port := range service.Spec.Ports {
 		var frontend *upcloud.LoadBalancerFrontend
 		var backend *upcloud.LoadBalancerBackend
@@ -132,24 +156,24 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		backend, err = r.getUpcloudBackendForPort(lb, &port)
 		if err != nil {
-			log.Error(err, "failed to get Upcloud Backend for a service port. Skipping port", "port", port)
-			continue
+			log.Error(err, "failed to get Upcloud Backend for a service port", "port", port)
+			return ctrl.Result{}, err
 		}
 		err = r.reconcileBackend(lb, backend, &nodes, &port)
 		if err != nil {
 			log.Error(err, "failed to reconcile Upcloud Backend for a service port", "port", port)
-			continue
+			return ctrl.Result{}, err
 		}
 
 		frontend, err = r.getUpcloudFrontendForPort(lb, &port)
 		if err != nil {
 			log.Error(err, "failed to get Upcloud Frontend for a service port", "port", port)
-			continue
+			return ctrl.Result{}, err
 		}
 		err = r.reconcileFrontend(lb, frontend, &port)
 		if err != nil {
 			log.Error(err, "failed to reconcile Upcloud Frontend for a service port", "port", port)
-			continue
+			return ctrl.Result{}, err
 		}
 	}
 
@@ -204,8 +228,9 @@ func (r *ServiceReconciler) getUpcloudLoadbalancerForService(service *corev1.Ser
 }
 
 func (r *ServiceReconciler) getUpcloudFrontendForPort(lb *upcloud.LoadBalancer, port *corev1.ServicePort) (*upcloud.LoadBalancerFrontend, error) {
+	portName := getPortPersistentName(port)
 	for _, f := range lb.Frontends {
-		if f.Name == getPortName(port) {
+		if f.Name == portName {
 			return &f, nil
 		}
 	}
@@ -231,8 +256,9 @@ func (r *ServiceReconciler) getUpcloudFrontendForPort(lb *upcloud.LoadBalancer, 
 }
 
 func (r *ServiceReconciler) getUpcloudBackendForPort(lb *upcloud.LoadBalancer, port *corev1.ServicePort) (*upcloud.LoadBalancerBackend, error) {
+	portName := getPortPersistentName(port)
 	for _, b := range lb.Backends {
-		if b.Name == getPortName(port) {
+		if b.Name == portName {
 			return &b, nil
 		}
 	}
@@ -345,7 +371,35 @@ func (r *ServiceReconciler) createBackendMember(lb *upcloud.LoadBalancer, b *upc
 }
 
 func (r *ServiceReconciler) reconcileBackendMember(lb *upcloud.LoadBalancer, b *upcloud.LoadBalancerBackend, m *upcloud.LoadBalancerBackendMember, n *corev1.Node, p *corev1.ServicePort) error {
-	return nil
+	addr, err := getNodeInternalIP(n)
+	if err != nil {
+		return err
+	}
+
+	// If the member doesn't deviate from the k8s state, do nothing
+	if m.IP == addr && m.Port == int(p.NodePort) {
+		return nil
+	}
+
+	upcloudOperations.With(prometheus.Labels{"resource": "LoadBalancerBackendMember", "operation": "MODIFY"}).Inc()
+	_, err = r.UpcloudSvc.ModifyLoadBalancerBackendMember(&upcloudrequest.ModifyLoadBalancerBackendMemberRequest{
+		ServiceUUID: lb.UUID,
+		BackendName: b.Name,
+		Member: upcloudrequest.ModifyLoadBalancerBackendMember{
+			Name:        n.Name,
+			Weight:      upcloud.IntPtr(1),
+			MaxSessions: upcloud.IntPtr(1000),
+			Enabled:     upcloud.BoolPtr(true),
+			Type:        "static",
+			IP:          upcloud.StringPtr(addr),
+			Port:        int(p.NodePort),
+		},
+	})
+	if err != nil {
+		upcloudOperationErrors.With(prometheus.Labels{"resource": "LoadBalancerBackendMember", "operation": "MODIFY"}).Inc()
+	}
+
+	return err
 }
 
 func (r *ServiceReconciler) deleteBackendMember(lb *upcloud.LoadBalancer, b *upcloud.LoadBalancerBackend, m *upcloud.LoadBalancerBackendMember) error {
@@ -361,6 +415,31 @@ func (r *ServiceReconciler) deleteBackendMember(lb *upcloud.LoadBalancer, b *upc
 
 	return err
 }
+
+func (r *ServiceReconciler) deleteBackend(lb *upcloud.LoadBalancer, b *upcloud.LoadBalancerBackend) error {
+	upcloudOperations.With(prometheus.Labels{"resource": "LoadBalancerBackend", "operation": "DELETE"}).Inc()
+	err := r.UpcloudSvc.DeleteLoadBalancerBackend(&upcloudrequest.DeleteLoadBalancerBackendRequest{
+		ServiceUUID: lb.UUID,
+		Name:        b.Name,
+	})
+	if err != nil {
+		upcloudOperationErrors.With(prometheus.Labels{"resource": "LoadBalancerBackend", "operation": "DELETE"}).Inc()
+	}
+
+	return err
+}
+
+func (r *ServiceReconciler) deleteFrontend(lb *upcloud.LoadBalancer, f *upcloud.LoadBalancerFrontend) error {
+	upcloudOperations.With(prometheus.Labels{"resource": "LoadBalancerFrontend", "operation": "DELETE"}).Inc()
+	err := r.UpcloudSvc.DeleteLoadBalancerFrontend(&upcloudrequest.DeleteLoadBalancerFrontendRequest{
+		ServiceUUID: lb.UUID,
+		Name:        f.Name,
+	})
+	if err != nil {
+		upcloudOperationErrors.With(prometheus.Labels{"resource": "LoadBalancerFrontend", "operation": "DELETE"}).Inc()
+	}
+
+	return err
 }
 
 func getNodeInternalIP(n *corev1.Node) (string, error) {
@@ -373,10 +452,15 @@ func getNodeInternalIP(n *corev1.Node) (string, error) {
 	return "", errors.New("node has no internal IP address")
 }
 
-func getPortName(p *corev1.ServicePort) string {
-	if p.Name != "" {
-		return p.Name
-	}
-
+func getPortPersistentName(p *corev1.ServicePort) string {
 	return fmt.Sprintf("port-%d", p.Port)
+}
+
+func findPort(ports *[]corev1.ServicePort, name string) *corev1.ServicePort {
+	for _, port := range *ports {
+		if getPortPersistentName(&port) == name {
+			return &port
+		}
+	}
+	return nil
 }
