@@ -35,30 +35,36 @@ func init() {
 	metrics.Registry.MustRegister(upcloudOperations, upcloudOperationErrors)
 }
 
-func FromK8sService(upcloudSvc *upcloudservice.Service, cfg *UpcloudLbConfig, svc *corev1.Service) (*UpcloudLb, error) {
+func New(upcloudSvc *upcloudservice.Service, cfg *UpcloudLbConfig) *UpcloudLb {
 	u := UpcloudLb{
 		cfg:        cfg,
 		upcloudSvc: upcloudSvc,
 	}
 
-	lbName := fmt.Sprintf("%s-%s", svc.Name, svc.UID)
+	return &u
+}
 
+func (u *UpcloudLb) Fetch(name string) (bool, error) {
 	lbs, err := u.listLoadBalancers()
 	if err != nil {
-		return &u, err
+		return false, err
 	}
 
 	for _, lb := range *lbs {
-		if lb.Name == lbName {
+		if lb.Name == name {
 			u.lb = &lb
-			return &u, nil
+			return true, nil
 		}
 	}
 
+	return false, nil
+}
+
+func (u *UpcloudLb) Create(name string) error {
 	// If no corresponding LB was found, try to create one
-	lb, err := u.createLoadBalancer(lbName)
+	lb, err := u.createLoadBalancer(name)
 	u.lb = lb
-	return &u, err
+	return err
 }
 
 func (u *UpcloudLb) listLoadBalancers() (*[]upcloud.LoadBalancer, error) {
@@ -89,10 +95,6 @@ func (u *UpcloudLb) createLoadBalancer(name string) (*upcloud.LoadBalancer, erro
 }
 
 func (u *UpcloudLb) Reconcile(ports *[]corev1.ServicePort) error {
-	if u.lb == nil {
-		panic("UpcloudLb was not properly initialized")
-	}
-
 	// Remove frontends not found in the service ports
 	for _, frontend := range u.lb.Frontends {
 		if findPort(ports, frontend.Name) != nil {
@@ -117,10 +119,6 @@ func (u *UpcloudLb) Reconcile(ports *[]corev1.ServicePort) error {
 }
 
 func (u *UpcloudLb) ReconcileBackends(ports *[]corev1.ServicePort, nodes *[]corev1.Node) error {
-	if u.lb == nil {
-		panic("UpcloudLb was not properly initialized")
-	}
-
 	for _, p := range *ports {
 		if err := u.updateBackendFor(&p, nodes); err != nil {
 			return err
@@ -131,10 +129,6 @@ func (u *UpcloudLb) ReconcileBackends(ports *[]corev1.ServicePort, nodes *[]core
 }
 
 func (u *UpcloudLb) ReconcileFrontends(ports *[]corev1.ServicePort) error {
-	if u.lb == nil {
-		panic("UpcloudLb was not properly initialized")
-	}
-
 	for _, p := range *ports {
 		if err := u.updateFrontendFor(&p); err != nil {
 			return err
@@ -233,6 +227,20 @@ func findPort(ports *[]corev1.ServicePort, name string) *corev1.ServicePort {
 
 func getPortPersistentName(p *corev1.ServicePort) string {
 	return fmt.Sprintf("port-%d", p.Port)
+}
+
+func (u *UpcloudLb) Delete() error {
+	upcloudOperations.With(prometheus.Labels{"resource": "LoadBalancer", "operation": "DELETE"}).Inc()
+	err := u.upcloudSvc.DeleteLoadBalancer(&upcloudrequest.DeleteLoadBalancerRequest{
+		UUID: u.lb.UUID,
+	})
+	if err != nil {
+		upcloudOperationErrors.With(prometheus.Labels{"resource": "LoadBalancer", "operation": "DELETE"}).Inc()
+	} else {
+		u.lb = nil
+	}
+
+	return err
 }
 
 func (u *UpcloudLb) deleteFrontend(f *upcloud.LoadBalancerFrontend) error {

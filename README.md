@@ -7,7 +7,7 @@ UpCloud Load Balancer Controller creates and manages [UpClound loadbalancers](ht
 - Creation of an Upcloud LB pointing to the cluster nodes for every LoadBalacner typed Service resource
 - Updating the existing Upcloud LB instance corresponding to a Service in response to changes in its configuration (e.g. ports added or ports deleted)
 - Reflecting the LB address in Service resource status.
-- **(NOT IMPLEMENTED)** Deletion of an Upcloud LB in response to deletion of the corresponding Service resource
+- Deletion of an Upcloud LB in response to deletion of the corresponding Service resource
 
 ## Demo
 
@@ -47,4 +47,12 @@ kuebctl apply demo/echo-server.yaml
 LB_ADDRESS=$(kubectl get svc echo-server -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
 echo "Is there anybody out there?" | nc ${LB_ADDRESS} 1234
 Is there anybody out there?
+```
+
+5. Cleanup
+```bash
+kubectl delete svc echo-server
+upctl server stop ulc-test --wait
+upctl server delete ulc-test
+upctl network delete ulc_test
 ```

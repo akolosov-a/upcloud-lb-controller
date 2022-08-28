@@ -22,10 +22,12 @@ import (
 	"time"
 
 	upcloudservice "github.com/UpCloudLtd/upcloud-go-api/v4/upcloud/service"
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"net.kolosov/upcloud-lb-controller/pkg/upcloudlb"
@@ -37,6 +39,7 @@ type ServiceReconciler struct {
 	Scheme       *runtime.Scheme
 	UpcloudSvc   *upcloudservice.Service
 	UpcloudLbCfg *upcloudlb.UpcloudLbConfig
+	log          logr.Logger
 }
 
 var (
@@ -59,31 +62,106 @@ var (
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.12.2/pkg/reconcile
 func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
+	r.log = log
 
 	var service corev1.Service
 	if err := r.Get(ctx, req.NamespacedName, &service); err != nil {
-		log.Error(err, "unable to fetch Service")
+		r.log.Error(err, "unable to fetch Service")
 
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	if service.Spec.Type != corev1.ServiceTypeLoadBalancer {
-		log.Info("Skipping non LoadBalancer service")
+		r.log.Info("Skipping non LoadBalancer service")
+		return ctrl.Result{}, nil
+	}
+
+	finalizerName := "upcloud-lb-controller.kolosov.net/finalizer"
+
+	// examine DeletionTimestamp to determine if object is under deletion
+	if service.ObjectMeta.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(&service, finalizerName) {
+			controllerutil.AddFinalizer(&service, finalizerName)
+			if err := r.Update(ctx, &service); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	} else {
+		// The object is being deleted
+		if controllerutil.ContainsFinalizer(&service, finalizerName) {
+			if err := r.deleteExternalResources(&service); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			controllerutil.RemoveFinalizer(&service, finalizerName)
+			if err := r.Update(ctx, &service); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+		// Stop reconciliation as the item is being deleted
 		return ctrl.Result{}, nil
 	}
 
 	var nodeList corev1.NodeList
 	if err := r.List(ctx, &nodeList); err != nil {
-		log.Error(err, "unable to list Nodes")
+		r.log.Error(err, "unable to list Nodes")
 		return ctrl.Result{Requeue: true}, err
 	}
 
-	log.Info("Fetching LoadBalancer for the service")
-	lb, err := upcloudlb.FromK8sService(r.UpcloudSvc, r.UpcloudLbCfg, &service)
+	lb, err := r.reconcileExternalResources(&service, &nodeList.Items)
 	if err != nil {
-		log.Error(err, "failed to fetch LoadBalancer for the service")
 		return ctrl.Result{}, err
 	}
+
+	if lb.OperationalState() == "running" {
+		r.log.Info("LoadBalancer is ready, updating Service status")
+		service.Status.LoadBalancer = corev1.LoadBalancerStatus{
+			Ingress: []corev1.LoadBalancerIngress{
+				{Hostname: lb.DNSName()},
+			},
+		}
+		if err := r.Status().Update(ctx, &service); err != nil {
+			r.log.Error(err, "unable to update Service status")
+			return ctrl.Result{}, err
+		}
+	} else {
+		d, err := time.ParseDuration(requeueDelay)
+		if err != nil {
+			panic(err)
+		}
+		r.log.Info(fmt.Sprintf("Loadbalancer is not ready yet, requeue after %s", d))
+		return ctrl.Result{RequeueAfter: d}, nil
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *ServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&corev1.Service{}).
+		Complete(r)
+}
+
+func (r *ServiceReconciler) reconcileExternalResources(service *corev1.Service, nodes *[]corev1.Node) (*upcloudlb.UpcloudLb, error) {
+	log := r.log
+
+	log.Info("Fetching LoadBalancer for the service")
+	lb := upcloudlb.New(r.UpcloudSvc, r.UpcloudLbCfg)
+	lbName := fmt.Sprintf("%s-%s", service.Name, service.UID)
+	found, err := lb.Fetch(lbName)
+	if err != nil {
+		log.Error(err, "failed to fetch LoadBalancer for the service")
+		return nil, err
+	}
+	if !found {
+		if err := lb.Create(lbName); err != nil {
+			log.Error(err, "failed to create LoadBalancer for the service")
+			return nil, err
+		}
+	}
+
 	log = log.WithValues("loadbalacner", lb.UUID())
 
 	ports := []corev1.ServicePort{}
@@ -99,45 +177,44 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	log.Info("Reconciling LoadBalancer for the service")
 	if err = lb.Reconcile(&ports); err != nil {
 		log.Error(err, "Failed to reconcile LoadBalancer")
-		return ctrl.Result{}, err
+		return lb, err
 	}
 
-	if err = lb.ReconcileBackends(&ports, &nodeList.Items); err != nil {
+	if err = lb.ReconcileBackends(&ports, nodes); err != nil {
 		log.Error(err, "Failed to reconcile LoadBalancer backends")
-		return ctrl.Result{}, err
+		return lb, err
 	}
 
 	if err = lb.ReconcileFrontends(&ports); err != nil {
 		log.Error(err, "Failed to reconcile LoadBalancer frontends")
-		return ctrl.Result{}, err
+		return lb, err
 	}
 
-	if lb.OperationalState() == "running" {
-		log.Info("LoadBalancer is ready, updating Service status")
-		service.Status.LoadBalancer = corev1.LoadBalancerStatus{
-			Ingress: []corev1.LoadBalancerIngress{
-				{Hostname: lb.DNSName()},
-			},
-		}
-		if err := r.Status().Update(ctx, &service); err != nil {
-			log.Error(err, "unable to update Service status")
-			return ctrl.Result{}, err
-		}
-	} else {
-		d, err := time.ParseDuration(requeueDelay)
-		if err != nil {
-			panic(err)
-		}
-		log.Info(fmt.Sprintf("Loadbalancer is not ready yet, requeue after %s", d))
-		return ctrl.Result{RequeueAfter: d}, nil
-	}
-
-	return ctrl.Result{}, nil
+	return lb, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
-func (r *ServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&corev1.Service{}).
-		Complete(r)
+func (r *ServiceReconciler) deleteExternalResources(service *corev1.Service) error {
+	log := r.log
+
+	lb := upcloudlb.New(r.UpcloudSvc, r.UpcloudLbCfg)
+	lbName := fmt.Sprintf("%s-%s", service.Name, service.UID)
+
+	log.Info("Fetching LoadBalancer for the service")
+	found, err := lb.Fetch(lbName)
+	if err != nil {
+		log.Error(err, "failed to fetch LoadBalancer for the service")
+		return err
+	}
+	if !found {
+		log.Info("LoadBalancer for Service not found")
+		return nil
+	}
+
+	log.Info("Deleting LoadBalancer for the service")
+	if err := lb.Delete(); err != nil {
+		log.Error(err, "failed to delete LoadBalancer for the service")
+		return err
+	}
+
+	return nil
 }

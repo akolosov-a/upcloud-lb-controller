@@ -33,6 +33,7 @@ spec:
         - configMapRef:
             name: upcloud-lb-controller
         image: ghcr.io/akolosov-a/upcloud-lb-controller:main
+        imagePullPolicy: Always
         name: manager
         securityContext:
           allowPrivilegeEscalation: false
