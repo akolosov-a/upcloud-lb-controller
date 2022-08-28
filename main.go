@@ -34,7 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"net.kolosov/upcloud-lb-controller/controllers"
-	"net.kolosov/upcloud-lb-controller/pkg/upcloudlbcontroller"
+	"net.kolosov/upcloud-lb-controller/pkg/upcloudlb"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -107,7 +107,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	upcloudLbCfg := &upcloudlbcontroller.UpcloudLbConfig{
+	upcloudLbCfg := &upcloudlb.UpcloudLbConfig{
 		Plan:    upcloudLbPlan,
 		Zone:    upcloudZone,
 		Network: upcloudLbNetwork,
