@@ -4,10 +4,21 @@ UpCloud Load Balancer Controller creates and manages [UpClound loadbalancers](ht
 [Loadbalacner Kubernetes Services](https://kubernetes.io/docs/concepts/services-networking/service/#loadbalancer).
 
 ## Features
-- Creation of an Upcloud LB pointing to the cluster nodes for every LoadBalacner typed Service resource
-- Updating the existing Upcloud LB instance corresponding to a Service in response to changes in its configuration (e.g. ports added or ports deleted)
+- Creation of an Upcloud LB pointing to the cluster nodes for every LoadBalacner typed Service resource.
+- Updating the existing Upcloud LB instance corresponding to a Service in response to changes in its configuration (e.g. ports added or ports deleted).
 - Reflecting the LB address in Service resource status.
-- Deletion of an Upcloud LB in response to deletion of the corresponding Service resource
+- Deletion of an Upcloud LB in response to deletion of the corresponding Service resource.
+
+## TODO
+- Improve unit testing (mocking Upcloud Service).
+- Implement integration testing.
+- Improve logging.
+- Add more metrics to better reflect controller's state.
+- Trigger LoadBalancers reconciliation on Node resources
+  updates. Currently addition or removal of a k8s node doesn't affect
+  existing loadbalancers.
+- Reflect LoadBalacner creation status in the status conditions of the
+  handled Service resources.
 
 ## Demo
 
