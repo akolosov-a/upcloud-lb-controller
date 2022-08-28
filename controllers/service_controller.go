@@ -53,13 +53,10 @@ var (
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the Service object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
 //
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.12.2/pkg/reconcile
+// This implementation reacts on updates to Service kubernetes
+// resources and creates or deletes Upcloud LoadBalancers for
+// LoadBalancer typed Services
 func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 	r.log = log
@@ -144,6 +141,8 @@ func (r *ServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+// reconcileExternalResources reconciles the state of the Upcloud
+// Loadbalancer corresponding to the given Service resource
 func (r *ServiceReconciler) reconcileExternalResources(service *corev1.Service, nodes *[]corev1.Node) (*upcloudlb.UpcloudLb, error) {
 	log := r.log
 
@@ -175,24 +174,16 @@ func (r *ServiceReconciler) reconcileExternalResources(service *corev1.Service, 
 	log = log.WithValues("ports", ports)
 
 	log.Info("Reconciling LoadBalancer for the service")
-	if err = lb.Reconcile(&ports); err != nil {
+	if err = lb.Update(&ports, nodes); err != nil {
 		log.Error(err, "Failed to reconcile LoadBalancer")
-		return lb, err
-	}
-
-	if err = lb.ReconcileBackends(&ports, nodes); err != nil {
-		log.Error(err, "Failed to reconcile LoadBalancer backends")
-		return lb, err
-	}
-
-	if err = lb.ReconcileFrontends(&ports); err != nil {
-		log.Error(err, "Failed to reconcile LoadBalancer frontends")
 		return lb, err
 	}
 
 	return lb, nil
 }
 
+// deleteExternalResources deletes Upcloud Loadbalancer corresponding
+// to the given Service resource
 func (r *ServiceReconciler) deleteExternalResources(service *corev1.Service) error {
 	log := r.log
 

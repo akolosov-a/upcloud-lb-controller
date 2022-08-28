@@ -12,6 +12,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
+// UpcloudLb implements Upcloud Loadbalancer reconciliation in
+// accordance with the given k8s Service and Nodes resources
+type UpcloudLb struct {
+	cfg        *UpcloudLbConfig
+	upcloudSvc *upcloudservice.Service
+	lb         *upcloud.LoadBalancer
+}
+
 var (
 	upcloudOperations = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -35,6 +43,7 @@ func init() {
 	metrics.Registry.MustRegister(upcloudOperations, upcloudOperationErrors)
 }
 
+// New creates an empty instance of UpcloudLb
 func New(upcloudSvc *upcloudservice.Service, cfg *UpcloudLbConfig) *UpcloudLb {
 	u := UpcloudLb{
 		cfg:        cfg,
@@ -44,6 +53,7 @@ func New(upcloudSvc *upcloudservice.Service, cfg *UpcloudLbConfig) *UpcloudLb {
 	return &u
 }
 
+// Fetch fetches an Upcloud Loadbalancer for the given name
 func (u *UpcloudLb) Fetch(name string) (bool, error) {
 	lbs, err := u.listLoadBalancers()
 	if err != nil {
@@ -60,11 +70,77 @@ func (u *UpcloudLb) Fetch(name string) (bool, error) {
 	return false, nil
 }
 
+// Create creates a new Upcloud Loadbalancer for the given name
 func (u *UpcloudLb) Create(name string) error {
 	// If no corresponding LB was found, try to create one
 	lb, err := u.createLoadBalancer(name)
 	u.lb = lb
 	return err
+}
+
+// Deletes this Upcloud Loadbalancer
+func (u *UpcloudLb) Delete() error {
+	upcloudOperations.With(prometheus.Labels{"resource": "LoadBalancer", "operation": "DELETE"}).Inc()
+	err := u.upcloudSvc.DeleteLoadBalancer(&upcloudrequest.DeleteLoadBalancerRequest{
+		UUID: u.lb.UUID,
+	})
+	if err != nil {
+		upcloudOperationErrors.With(prometheus.Labels{"resource": "LoadBalancer", "operation": "DELETE"}).Inc()
+	} else {
+		u.lb = nil
+	}
+
+	return err
+}
+
+// Reconcile updates this LoadBalancer in accordance with the given list of ServicePorts and Nodes
+func (u *UpcloudLb) Update(ports *[]corev1.ServicePort, nodes *[]corev1.Node) error {
+	// Remove frontends not found in the service ports
+	for _, frontend := range u.lb.Frontends {
+		if findPort(ports, frontend.Name) != nil {
+			continue
+		}
+		if err := u.deleteFrontend(&frontend); err != nil {
+			return err
+		}
+	}
+
+	// Remove backends not found in the service ports
+	for _, backend := range u.lb.Backends {
+		if findPort(ports, backend.Name) != nil {
+			continue
+		}
+		if err := u.deleteBackend(&backend); err != nil {
+			return err
+		}
+	}
+
+	// Create or update LB's backends and frontends corresponding to each ServicePort
+	for _, p := range *ports {
+		if err := u.updateBackendFor(&p, nodes); err != nil {
+			return err
+		}
+		if err := u.updateFrontendFor(&p); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// DNSName returns DNS name of this Upcloud LoadBalancer
+func (u *UpcloudLb) DNSName() string {
+	return u.lb.DNSName
+}
+
+// OperationalState returns operational state of this Upcloud LoadBalancer
+func (u *UpcloudLb) OperationalState() upcloud.LoadBalancerOperationalState {
+	return u.lb.OperationalState
+}
+
+// UUID returns UUID of this Upcloud LoadBalancer
+func (u *UpcloudLb) UUID() string {
+	return u.lb.UUID
 }
 
 func (u *UpcloudLb) listLoadBalancers() (*[]upcloud.LoadBalancer, error) {
@@ -94,68 +170,12 @@ func (u *UpcloudLb) createLoadBalancer(name string) (*upcloud.LoadBalancer, erro
 	return lb, err
 }
 
-func (u *UpcloudLb) Reconcile(ports *[]corev1.ServicePort) error {
-	// Remove frontends not found in the service ports
-	for _, frontend := range u.lb.Frontends {
-		if findPort(ports, frontend.Name) != nil {
-			continue
-		}
-		if err := u.deleteFrontend(&frontend); err != nil {
-			return err
-		}
-	}
-
-	// Remove backends not found in the service ports
-	for _, backend := range u.lb.Backends {
-		if findPort(ports, backend.Name) != nil {
-			continue
-		}
-		if err := u.deleteBackend(&backend); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (u *UpcloudLb) ReconcileBackends(ports *[]corev1.ServicePort, nodes *[]corev1.Node) error {
-	for _, p := range *ports {
-		if err := u.updateBackendFor(&p, nodes); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (u *UpcloudLb) ReconcileFrontends(ports *[]corev1.ServicePort) error {
-	for _, p := range *ports {
-		if err := u.updateFrontendFor(&p); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (u *UpcloudLb) DNSName() string {
-	return u.lb.DNSName
-}
-
-func (u *UpcloudLb) OperationalState() upcloud.LoadBalancerOperationalState {
-	return u.lb.OperationalState
-}
-
-func (u *UpcloudLb) UUID() string {
-	return u.lb.UUID
-}
-
 func (u *UpcloudLb) updateBackendFor(port *corev1.ServicePort, nodes *[]corev1.Node) error {
 	var b *upcloud.LoadBalancerBackend
 	var err error
 	name := getPortPersistentName(port)
 
-	b = u.findBackend(name)
+	b = u.getBackend(name)
 	if b == nil {
 		b, err = u.createBackend(name)
 		if err != nil {
@@ -206,7 +226,7 @@ func (u *UpcloudLb) updateBackendFor(port *corev1.ServicePort, nodes *[]corev1.N
 	return nil
 }
 
-func (u *UpcloudLb) findBackend(name string) *upcloud.LoadBalancerBackend {
+func (u *UpcloudLb) getBackend(name string) *upcloud.LoadBalancerBackend {
 	for _, b := range u.lb.Backends {
 		if b.Name == name {
 			return &b
@@ -214,33 +234,6 @@ func (u *UpcloudLb) findBackend(name string) *upcloud.LoadBalancerBackend {
 	}
 
 	return nil
-}
-
-func findPort(ports *[]corev1.ServicePort, name string) *corev1.ServicePort {
-	for _, port := range *ports {
-		if getPortPersistentName(&port) == name {
-			return &port
-		}
-	}
-	return nil
-}
-
-func getPortPersistentName(p *corev1.ServicePort) string {
-	return fmt.Sprintf("port-%d", p.Port)
-}
-
-func (u *UpcloudLb) Delete() error {
-	upcloudOperations.With(prometheus.Labels{"resource": "LoadBalancer", "operation": "DELETE"}).Inc()
-	err := u.upcloudSvc.DeleteLoadBalancer(&upcloudrequest.DeleteLoadBalancerRequest{
-		UUID: u.lb.UUID,
-	})
-	if err != nil {
-		upcloudOperationErrors.With(prometheus.Labels{"resource": "LoadBalancer", "operation": "DELETE"}).Inc()
-	} else {
-		u.lb = nil
-	}
-
-	return err
 }
 
 func (u *UpcloudLb) deleteFrontend(f *upcloud.LoadBalancerFrontend) error {
@@ -381,6 +374,19 @@ func (u *UpcloudLb) deleteBackendMember(m *upcloud.LoadBalancerBackendMember, bN
 	}
 
 	return err
+}
+
+func findPort(ports *[]corev1.ServicePort, name string) *corev1.ServicePort {
+	for _, port := range *ports {
+		if getPortPersistentName(&port) == name {
+			return &port
+		}
+	}
+	return nil
+}
+
+func getPortPersistentName(p *corev1.ServicePort) string {
+	return fmt.Sprintf("port-%d", p.Port)
 }
 
 func getNodeInternalIP(n *corev1.Node) (string, error) {
